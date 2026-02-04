@@ -10,15 +10,14 @@ from groq import Groq
 
 # Initialize FastAPI
 app = FastAPI(
-    title="Crypto Brain API (Groq Edition)",
-    description="Sentiment (Llama 8B) + Reasoning (DeepSeek 70B)",
-    version="2.0.0"
+    title="Crypto Brain API (GPT-OSS Edition)",
+    description="Sentiment (GPT-OSS 20B) + Reasoning (GPT-OSS 120B)",
+    version="3.0.0"
 )
 
 # ==========================================
 # 0. SECURITY & CONFIGURATION
 # ==========================================
-# Get these from Render Environment Variables
 API_KEY = os.getenv("API_KEY", "default-insecure-key")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -32,8 +31,6 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
 # ==========================================
 # 1. LOAD CLIENTS
 # ==========================================
-print("⏳ System Startup: Connecting to Groq...")
-
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
     print("✅ Groq Client: Connected")
@@ -54,11 +51,18 @@ class Candle(BaseModel):
     low: float
     volume: float
 
+class LastPrediction(BaseModel):
+    action: str
+    confidence: float
+    reason: Optional[str] = None
+    created_at: Optional[str] = None 
+
 class PredictRequest(BaseModel):
     symbol: str
     current_price: float
     last_50_candles: List[Candle]
     sentiment_context: Optional[str] = "Neutral"
+    last_prediction: Optional[LastPrediction] = None
 
 class PredictResponse(BaseModel):
     action: str
@@ -68,8 +72,8 @@ class PredictResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     prompt: str
-    max_tokens: Optional[int] = 500
-    temperature: Optional[float] = 0.6
+    max_tokens: Optional[int] = 1024
+    temperature: Optional[float] = 0.7
     system_instruction: Optional[str] = "You are a helpful AI assistant."
 
 class SummaryRequest(BaseModel):
@@ -80,27 +84,24 @@ class SummaryRequest(BaseModel):
 # 3. HELPER FUNCTIONS
 # ==========================================
 def format_market_data(candles: List[Candle]) -> str:
-    # Reduce data size to save tokens context
-    closes = [str(round(c.close, 2)) for c in candles[-30:]] # Last 30 candles
+    closes = [str(round(c.close, 2)) for c in candles[-30:]] 
     return f"- Closing Prices: {', '.join(closes)}"
 
 def clean_json_response(text: str):
     """
-    Cleans the DeepSeek/Llama thinking tokens and extracts valid JSON.
+    Fallback cleaner in case Groq sends back raw text despite JSON mode.
     """
-    # Remove DeepSeek <think> blocks if present
+    # Remove <think> blocks common in reasoning models
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    
-    # Try to find JSON inside code blocks
-    match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
-    if match: return json.loads(match.group(1))
-    
-    # Try to find raw JSON brackets
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match: return json.loads(match.group(0))
-    
-    # Fallback
-    return {"error": "Failed to parse JSON", "raw": text}
+    text = text.replace("```json", "").replace("```", "")
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        try:
+            return json.loads(text[start : end + 1])
+        except:
+            pass
+    return {"action": "HOLD", "confidence": 0.0, "reason": "JSON Parse Error", "trend": "Unknown"}
 
 # ==========================================
 # 4. API ENDPOINTS
@@ -108,99 +109,147 @@ def clean_json_response(text: str):
 
 @app.get("/")
 def home():
-    return {"status": "Online 🚀", "provider": "Groq"}
+    return {"status": "Online 🚀", "provider": "Groq (GPT-OSS)"}
 
-@app.get("/health")
-def health_check():
-    return {"status": "online"}
-
-# --- SENTIMENT (Llama 3 8B) ---
+# --- SENTIMENT (GPT-OSS 20B) ---
 @app.post("/sentiment", dependencies=[Security(get_api_key)])
 def analyze_sentiment(req: SentimentRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
-    # Prompt designed to mimic the original Classifier output (Label + Score)
-    # but with the added intelligence of an LLM.
-    prompt = f"""
-    Analyze the sentiment of this crypto text: "{req.text}"
+    # Limit input to avoid token overflow
+    safe_text = req.text[:4000]
+
+    system_prompt = """
+    You are a financial sentiment analyzer. 
+    You MUST respond with valid JSON only. 
+    Do not output any thinking tags or conversational text.
+    """
+
+    user_prompt = f"""
+    Analyze the sentiment of this text: "{safe_text}"
     
-    Return JSON ONLY with these exact fields:
-    - label: "POSITIVE" or "NEGATIVE" or "NEUTRAL"
-    - score: A float between 0.0 and 1.0 representing intensity.
+    Return JSON format:
+    {{
+        "label": "POSITIVE" | "NEGATIVE" | "NEUTRAL",
+        "score": 0.0 to 1.0
+    }}
     """
 
     try:
         completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",  # Fast model for simple tasks
-            messages=[{"role": "user", "content": prompt}],
+            model="openai/gpt-oss-20b", # Using 20B for faster, lighter tasks
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             temperature=0.1,
-            max_tokens=100,
+            max_completion_tokens=500,
             response_format={"type": "json_object"}
         )
         return json.loads(completion.choices[0].message.content)
     except Exception as e:
-        raise HTTPException(500, f"Groq Error: {str(e)}")
+        print(f"Sentiment Error: {e}")
+        # Return neutral fallback to keep client alive
+        return {"label": "NEUTRAL", "score": 0.0}
 
-# --- PREDICT (DeepSeek 70B) ---
+# --- PREDICT (GPT-OSS 120B) ---
 @app.post("/predict", response_model=PredictResponse, dependencies=[Security(get_api_key)])
 def predict_market(req: PredictRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
-    prompt = f"""
-    Act as a professional Crypto Trader. Output JSON ONLY.
-    SYMBOL: {req.symbol} | SENTIMENT: {req.sentiment_context}
-    DATA: {format_market_data(req.last_50_candles)}
+    # 1. Build Context
+    context_str = "No previous trade."
+    if req.last_prediction:
+        context_str = f"""
+        PREVIOUS TRADE: {req.last_prediction.action} 
+        CONFIDENCE: {req.last_prediction.confidence}
+        REASON: {req.last_prediction.reason}
+        """
 
-    Response Format:
-    {{ "trend": "Bullish/Bearish", "action": "BUY/SELL/HOLD", "confidence": 0.0-1.0, "reason": "Short reason" }}
+    # 2. Strict System Prompt
+    # GPT-OSS 120B is a reasoning model, so we must tell it to contain its thinking
+    # or rely on Groq's JSON mode to strip it.
+    system_prompt = """
+    You are an expert Crypto Trader.
+    Output a SINGLE valid JSON object.
+    Do not include markdown formatting or explanations outside the JSON.
+    """
+
+    user_prompt = f"""
+    DATA:
+    Symbol: {req.symbol}
+    Price: {req.current_price}
+    Sentiment: {req.sentiment_context}
+    Candles: {format_market_data(req.last_50_candles)}
+    
+    {context_str}
+
+    REQUIRED JSON OUTPUT:
+    {{
+        "trend": "Bullish" or "Bearish",
+        "action": "BUY" or "SELL" or "HOLD",
+        "confidence": 0.0 to 1.0,
+        "reason": "Short explanation"
+    }}
     """
 
     try:
         completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b", # The "Reasoning" Model
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.6, # DeepSeek recommends 0.6 for reasoning
-            max_tokens=2048,
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.6, # 120B likes slightly higher temp for reasoning
+            max_completion_tokens=4096, # Give it space to reason (internal)
+            reasoning_effort="medium", # Key parameter for 120B
             response_format={"type": "json_object"}
         )
+        
         content = completion.choices[0].message.content
-        return clean_json_response(content)
+        return json.loads(content)
+        
     except Exception as e:
+        print(f"Prediction Error: {e}")
+        # If strict JSON fails, try the cleaner or raise error
+        if "json_validate_failed" in str(e):
+             print("⚠️ Model output invalid JSON (likely reasoning leak).")
         raise HTTPException(500, f"Groq Error: {str(e)}")
 
-# --- CHAT (Llama 3 70B) ---
+# --- CHAT (GPT-OSS 120B) ---
 @app.post("/chat", dependencies=[Security(get_api_key)])
 def chat_generate(req: ChatRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile", # Best general purpose chat model
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": req.system_instruction},
                 {"role": "user", "content": req.prompt}
             ],
             temperature=req.temperature,
-            max_tokens=req.max_tokens
+            max_completion_tokens=req.max_tokens,
+            reasoning_effort="medium" 
         )
         return {"response": completion.choices[0].message.content}
     except Exception as e:
         raise HTTPException(500, f"Groq Error: {str(e)}")
 
-# --- SUMMARY (Llama 3 8B) ---
+# --- SUMMARY (GPT-OSS 20B) ---
 @app.post("/summary", dependencies=[Security(get_api_key)])
 def generate_summary(req: SummaryRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
     try:
         completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b", # Fast for summarization
+            model="openai/gpt-oss-20b",
             messages=[
-                {"role": "system", "content": "You are a precise summarizer. Output ONLY the summary."},
+                {"role": "system", "content": "Summarize concisely."},
                 {"role": "user", "content": f"Summarize this text into {req.target_length}:\n\n{req.text}"}
             ],
-            temperature=0.1,
-            max_tokens=2048
+            temperature=0.5,
+            max_completion_tokens=1024
         )
         return {"summary": completion.choices[0].message.content}
     except Exception as e:
