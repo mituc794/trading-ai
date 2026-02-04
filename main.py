@@ -12,7 +12,7 @@ from groq import Groq
 app = FastAPI(
     title="Crypto Brain API (GPT-OSS Edition)",
     description="Sentiment (GPT-OSS 20B) + Reasoning (GPT-OSS 120B)",
-    version="3.0.0"
+    version="3.0.1"
 )
 
 # ==========================================
@@ -111,12 +111,16 @@ def clean_json_response(text: str):
 def home():
     return {"status": "Online 🚀", "provider": "Groq (GPT-OSS)"}
 
+# ✅ RESTORED HEALTH ENDPOINT
+@app.get("/health")
+def health_check():
+    return {"status": "online"}
+
 # --- SENTIMENT (GPT-OSS 20B) ---
 @app.post("/sentiment", dependencies=[Security(get_api_key)])
 def analyze_sentiment(req: SentimentRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
-    # Limit input to avoid token overflow
     safe_text = req.text[:4000]
 
     system_prompt = """
@@ -137,7 +141,7 @@ def analyze_sentiment(req: SentimentRequest):
 
     try:
         completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b", # Using 20B for faster, lighter tasks
+            model="openai/gpt-oss-20b", 
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -149,7 +153,6 @@ def analyze_sentiment(req: SentimentRequest):
         return json.loads(completion.choices[0].message.content)
     except Exception as e:
         print(f"Sentiment Error: {e}")
-        # Return neutral fallback to keep client alive
         return {"label": "NEUTRAL", "score": 0.0}
 
 # --- PREDICT (GPT-OSS 120B) ---
@@ -157,7 +160,6 @@ def analyze_sentiment(req: SentimentRequest):
 def predict_market(req: PredictRequest):
     if not groq_client: raise HTTPException(500, "Groq API Key not set")
 
-    # 1. Build Context
     context_str = "No previous trade."
     if req.last_prediction:
         context_str = f"""
@@ -166,9 +168,6 @@ def predict_market(req: PredictRequest):
         REASON: {req.last_prediction.reason}
         """
 
-    # 2. Strict System Prompt
-    # GPT-OSS 120B is a reasoning model, so we must tell it to contain its thinking
-    # or rely on Groq's JSON mode to strip it.
     system_prompt = """
     You are an expert Crypto Trader.
     Output a SINGLE valid JSON object.
@@ -200,9 +199,9 @@ def predict_market(req: PredictRequest):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.6, # 120B likes slightly higher temp for reasoning
-            max_completion_tokens=4096, # Give it space to reason (internal)
-            reasoning_effort="medium", # Key parameter for 120B
+            temperature=0.6,
+            max_completion_tokens=4096,
+            reasoning_effort="medium",
             response_format={"type": "json_object"}
         )
         
@@ -211,9 +210,6 @@ def predict_market(req: PredictRequest):
         
     except Exception as e:
         print(f"Prediction Error: {e}")
-        # If strict JSON fails, try the cleaner or raise error
-        if "json_validate_failed" in str(e):
-             print("⚠️ Model output invalid JSON (likely reasoning leak).")
         raise HTTPException(500, f"Groq Error: {str(e)}")
 
 # --- CHAT (GPT-OSS 120B) ---
