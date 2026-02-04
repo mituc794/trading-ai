@@ -131,7 +131,7 @@ def analyze_sentiment(req: SentimentRequest):
 
     try:
         completion = groq_client.chat.completions.create(
-            model="llama3-8b-8192",  # Fast model for simple tasks
+            model="openai/gpt-oss-20b",  # Fast model for simple tasks
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=100,
@@ -194,7 +194,7 @@ def generate_summary(req: SummaryRequest):
 
     try:
         completion = groq_client.chat.completions.create(
-            model="llama3-8b-8192", # Fast for summarization
+            model="openai/gpt-oss-20b", # Fast for summarization
             messages=[
                 {"role": "system", "content": "You are a precise summarizer. Output ONLY the summary."},
                 {"role": "user", "content": f"Summarize this text into {req.target_length}:\n\n{req.text}"}
